@@ -35,7 +35,7 @@ func FixedBytes(x byte, len int) []byte {
 	return bytes
 }
 
-func main0() {
+func main() {
 	arraybase, err := ytab.InitArrayBase(context.Background(), "e:\\syncdata", 1000000, 10, 10)
 	if err != nil {
 		panic(err)
@@ -96,7 +96,7 @@ func main0() {
 	wg2.Wait()
 }
 
-func main() {
+func main1() {
 	arraybase, err := ytab.InitArrayBase(context.Background(), "e:\\syncdata", 1000000, 10, 10)
 	if err != nil {
 		panic(err)

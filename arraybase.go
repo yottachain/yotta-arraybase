@@ -18,6 +18,7 @@ import (
 )
 
 type ReadAck struct {
+	FIndex uint64
 	Blocks map[uint64]*Block
 	Err    error
 }
@@ -41,7 +42,8 @@ type WriteMsg struct {
 }
 
 type NullAck struct {
-	Err error
+	FIndex uint64
+	Err    error
 }
 
 type InsertMsg struct {
@@ -60,11 +62,16 @@ type DeleteMsg struct {
 	AckCh   chan *NullAck
 }
 
+type SyncMsg struct {
+	AckCh chan *NullAck
+}
+
 type FileOpChan struct {
 	QueryCh  chan *ReadMsg
 	UpdateCh chan *UpdateMsg
 	InsertCh chan *InsertMsg
 	DeleteCh chan *DeleteMsg
+	SyncCh   chan *SyncMsg
 }
 
 type CheckPoint struct {
@@ -87,11 +94,7 @@ type ArrayBase struct {
 var ErrChFullFilled = errors.New("channel is fullfilled")
 
 func InitArrayBase(ctx context.Context, baseDir string, rowsPerFile uint64, readChLen, writeChLen int) (*ArrayBase, error) {
-	// rowsPerFile = 1000000
-	// baseDir = "D:\\syncdata"
 	dbDir := path.Join(baseDir, "db")
-	// mask := syscall.Umask(0)
-	// defer syscall.Umask(mask)
 	if !isExist(baseDir) {
 		err := os.Mkdir(baseDir, 0775)
 		if err != nil {
@@ -137,6 +140,7 @@ func InitArrayBase(ctx context.Context, baseDir string, rowsPerFile uint64, read
 			UpdateCh: make(chan *UpdateMsg),
 			InsertCh: make(chan *InsertMsg),
 			DeleteCh: make(chan *DeleteMsg),
+			SyncCh:   make(chan *SyncMsg),
 		}
 		f, err := os.OpenFile(filepath.Join(arrayBase.baseDir, fmt.Sprintf("%d.dat", i)), os.O_RDWR|os.O_CREATE, 0755)
 		if err != nil {
@@ -210,6 +214,7 @@ func (db *ArrayBase) write(ctx context.Context) {
 					UpdateCh: make(chan *UpdateMsg),
 					InsertCh: make(chan *InsertMsg),
 					DeleteCh: make(chan *DeleteMsg),
+					SyncCh:   make(chan *SyncMsg),
 				}
 				f, err := os.OpenFile(filepath.Join(db.baseDir, fmt.Sprintf("%d.dat", fi)), os.O_RDWR|os.O_CREATE, 0755)
 				if err != nil {
@@ -240,18 +245,6 @@ func (db *ArrayBase) write(ctx context.Context) {
 			allChs = append(allChs, insMsg.AckCh)
 			selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(insMsg.AckCh)})
 		}
-		//update
-		mu := make(map[uint64][]*RebuildMeta)
-		for _, rebuild := range msg.Rebuilds {
-			fileIndex := rebuild.BIndex / db.checkpoint.RowsPerFile
-			mu[fileIndex] = append(mu[fileIndex], rebuild)
-		}
-		for k, v := range mu {
-			umsg := &UpdateMsg{Rebuilds: v, AckCh: make(chan *NullAck, 1)}
-			db.opchans[k].UpdateCh <- umsg
-			allChs = append(allChs, umsg.AckCh)
-			selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(umsg.AckCh)})
-		}
 		//delete
 		md := make(map[uint64][]uint64)
 		for _, index := range msg.Deletes {
@@ -264,7 +257,20 @@ func (db *ArrayBase) write(ctx context.Context) {
 			allChs = append(allChs, dmsg.AckCh)
 			selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(dmsg.AckCh)})
 		}
+		//update
+		mu := make(map[uint64][]*RebuildMeta)
+		for _, rebuild := range msg.Rebuilds {
+			fileIndex := rebuild.BIndex / db.checkpoint.RowsPerFile
+			mu[fileIndex] = append(mu[fileIndex], rebuild)
+		}
+		for k, v := range mu {
+			umsg := &UpdateMsg{Rebuilds: v, AckCh: make(chan *NullAck, 1)}
+			db.opchans[k].UpdateCh <- umsg
+			allChs = append(allChs, umsg.AckCh)
+			selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(umsg.AckCh)})
+		}
 		//processing acknowledge
+		syncFileIndexes := make(map[uint64]bool)
 		for i := 0; i < len(selectCase); i++ {
 			chosen, recv, recvOk := reflect.Select(selectCase)
 			if recvOk {
@@ -272,159 +278,87 @@ func (db *ArrayBase) write(ctx context.Context) {
 				if ack.Err != nil {
 					wack.Err = ack.Err
 				}
+				syncFileIndexes[ack.FIndex] = true
 				close(allChs[chosen])
 			}
 		}
 		//submit change
 		if wack.Err == nil {
-			newFileIndex := db.checkpoint.FileIndex + (db.checkpoint.FileOffset+uint64(len(msg.Blocks)))/db.checkpoint.RowsPerFile
-			newFileOffset := (db.checkpoint.FileOffset + uint64(len(msg.Blocks))) % db.checkpoint.RowsPerFile
-			err := db.UpdateCheckPoint(ctx, newFileIndex, newFileOffset, time.Now().Unix())
-			if err != nil {
-				continue
+			allChs := make([]chan *NullAck, 0)
+			selectCase := make([]reflect.SelectCase, 0)
+			for k := range syncFileIndexes {
+				smsg := &SyncMsg{AckCh: make(chan *NullAck, 1)}
+				db.opchans[k].SyncCh <- smsg
+				allChs = append(allChs, smsg.AckCh)
+				selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(smsg.AckCh)})
 			}
-			db.checkpoint.FileIndex = newFileIndex
-			db.checkpoint.FileOffset = newFileOffset
-			wack.To = newFileIndex*db.checkpoint.RowsPerFile + newFileOffset
+			for i := 0; i < len(selectCase); i++ {
+				chosen, recv, recvOk := reflect.Select(selectCase)
+				if recvOk {
+					ack, _ := recv.Interface().(*NullAck)
+					if ack.Err != nil {
+						wack.Err = ack.Err
+					}
+					close(allChs[chosen])
+				}
+			}
+			if wack.Err == nil {
+				newFileIndex := db.checkpoint.FileIndex + (db.checkpoint.FileOffset+uint64(len(msg.Blocks)))/db.checkpoint.RowsPerFile
+				newFileOffset := (db.checkpoint.FileOffset + uint64(len(msg.Blocks))) % db.checkpoint.RowsPerFile
+				err := db.UpdateCheckPoint(ctx, newFileIndex, newFileOffset, time.Now().Unix())
+				if err != nil {
+					continue
+				}
+				db.checkpoint.FileIndex = newFileIndex
+				db.checkpoint.FileOffset = newFileOffset
+				wack.To = newFileIndex*db.checkpoint.RowsPerFile + newFileOffset
+			}
 		}
 		msg.AckCh <- wack
 	}
 }
 
 func (db *ArrayBase) processRead(fileIndex uint64, opch *FileOpChan, f *os.File) {
-	for {
-		select {
-		case qry := <-opch.QueryCh:
-			ack := new(ReadAck)
-			blocks := make(map[uint64]*Block)
-			for _, index := range qry.Bindexes {
-				buf := make([]byte, 4096)
-				n, err := f.ReadAt(buf, int64(index-fileIndex*db.checkpoint.RowsPerFile)*4096)
-				if err != nil {
-					ack.Err = err
-					break
-				}
-				if n != 4096 {
-					ack.Err = errors.New("length of read data is not 4096")
-					break
-				}
-				block := new(Block)
-				err = block.FillBy(buf)
-				if err != nil {
-					ack.Err = err
-					break
-				}
-				if block.ID == 0 {
-					blocks[index] = nil
-				} else {
-					blocks[index] = block
-				}
+	for qry := range opch.QueryCh {
+		ack := new(ReadAck)
+		ack.FIndex = fileIndex
+		blocks := make(map[uint64]*Block)
+		for _, index := range qry.Bindexes {
+			buf := make([]byte, 4096)
+			n, err := f.ReadAt(buf, int64(index-fileIndex*db.checkpoint.RowsPerFile)*4096)
+			if err != nil {
+				ack.Err = err
+				break
 			}
-			if ack.Err == nil {
-				ack.Blocks = blocks
+			if n != 4096 {
+				ack.Err = errors.New("length of read data is not 4096")
+				break
 			}
-			qry.AckCh <- ack
+			block := new(Block)
+			err = block.FillBy(buf)
+			if err != nil {
+				ack.Err = err
+				break
+			}
+			if block.ID == 0 {
+				blocks[index] = nil
+			} else {
+				blocks[index] = block
+			}
 		}
+		if ack.Err == nil {
+			ack.Blocks = blocks
+		}
+		qry.AckCh <- ack
 	}
 }
 
 func (db *ArrayBase) processWrite(fileIndex uint64, opch *FileOpChan, f *os.File) {
-	// opchans := make([]chan *UpdateMsg, 0)
-	// for i := 0; i < 10; i++ {
-	// 	opchan := make(chan *UpdateMsg)
-	// 	opchans = append(opchans, opchan)
-	// 	go func() {
-	// 		for upt := range opchan {
-	// 			ack := new(NullAck)
-	// 			for _, meta := range upt.Rebuilds {
-	// 				buf := make([]byte, 4096)
-	// 				n, err := f.ReadAt(buf, int64(meta.BIndex-fileIndex*db.checkpoint.RowsPerFile)*4096) //bindex换算成当前文件中的偏移量再读取
-	// 				if err != nil {
-	// 					ack.Err = err
-	// 					break
-	// 				}
-	// 				if n != 4096 {
-	// 					ack.Err = errors.New("length of read data is not 4096")
-	// 					break
-	// 				}
-	// 				block := new(Block)
-	// 				err = block.FillBy(buf)
-	// 				if err != nil {
-	// 					ack.Err = err
-	// 					break
-	// 				}
-	// 				if block.ID == 0 {
-	// 					//block已被删除
-	// 					continue
-	// 				}
-	// 				for _, t := range meta.Transfers {
-	// 					shard := block.Shards[t.Offset]
-	// 					if t.SID == shard.NodeID && shard.NodeID2 == 0 {
-	// 						shard.NodeID = t.NID
-	// 					} else if t.SID == shard.NodeID && shard.NodeID == shard.NodeID2 {
-	// 						shard.NodeID = t.NID
-	// 						shard.NodeID2 = t.NID
-	// 					} else if t.SID == shard.NodeID && shard.NodeID2 == t.NID {
-	// 						shard.NodeID = t.NID
-	// 					} else if t.SID == shard.NodeID2 && shard.NodeID == t.NID {
-	// 						shard.NodeID2 = t.NID
-	// 					} else if t.SID == shard.NodeID && shard.NodeID2 != 0 {
-	// 						shard.NodeID = t.NID
-	// 					} else if t.SID == shard.NodeID2 && shard.NodeID != 0 {
-	// 						shard.NodeID2 = t.NID
-	// 					} else {
-	// 						continue
-	// 					}
-	// 					block.Shards[t.Offset] = shard
-	// 				}
-	// 				n, err = f.WriteAt(block.ConvertBytes(), int64(meta.BIndex-fileIndex*db.checkpoint.RowsPerFile)*4096)
-	// 				if err != nil {
-	// 					ack.Err = err
-	// 					break
-	// 				}
-	// 				if n != 4096 {
-	// 					ack.Err = errors.New("length of write data is not 4096")
-	// 					break
-	// 				}
-	// 			}
-	// 			upt.AckCh <- ack
-	// 		}
-	// 	}()
-	// }
 	for {
 		select {
-		// case qry := <-opch.QueryCh:
-		// 	ack := new(ReadAck)
-		// 	blocks := make(map[uint64]*Block)
-		// 	for _, index := range qry.Bindexes {
-		// 		buf := make([]byte, 4096)
-		// 		n, err := f.ReadAt(buf, int64(index-fileIndex*db.checkpoint.RowsPerFile)*4096)
-		// 		if err != nil {
-		// 			ack.Err = err
-		// 			break
-		// 		}
-		// 		if n != 4096 {
-		// 			ack.Err = errors.New("length of read data is not 4096")
-		// 			break
-		// 		}
-		// 		block := new(Block)
-		// 		err = block.FillBy(buf)
-		// 		if err != nil {
-		// 			ack.Err = err
-		// 			break
-		// 		}
-		// 		if block.ID == 0 {
-		// 			blocks[index] = nil
-		// 		} else {
-		// 			blocks[index] = block
-		// 		}
-		// 	}
-		// 	if ack.Err == nil {
-		// 		ack.Blocks = blocks
-		// 	}
-		// 	qry.AckCh <- ack
 		case ins := <-opch.InsertCh:
 			ack := new(NullAck)
+			ack.FIndex = fileIndex
 			if db.checkpoint.FileIndex != fileIndex {
 				ack.Err = errors.New("current file is not latest file")
 			} else {
@@ -443,31 +377,7 @@ func (db *ArrayBase) processWrite(fileIndex uint64, opch *FileOpChan, f *os.File
 			ins.AckCh <- ack
 		case upt := <-opch.UpdateCh:
 			ack := new(NullAck)
-			// reqMap := make(map[int][]*RebuildMeta)
-			// for _, meta := range upt.Rebuilds {
-			// 	index := (meta.BIndex - fileIndex*db.checkpoint.RowsPerFile) / (db.checkpoint.RowsPerFile / 10)
-			// 	reqMap[int(index)] = append(reqMap[int(index)], meta)
-			// }
-			// allChs := make([]chan *NullAck, 0)
-			// selectCase := make([]reflect.SelectCase, 0)
-			// for k, v := range reqMap {
-			// 	umsg := &UpdateMsg{Rebuilds: v, AckCh: make(chan *NullAck, 1)}
-			// 	opchans[k] <- umsg
-			// 	allChs = append(allChs, umsg.AckCh)
-			// 	selectCase = append(selectCase, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(umsg.AckCh)})
-			// }
-			// for i := 0; i < len(selectCase); i++ {
-			// 	chosen, recv, recvOk := reflect.Select(selectCase)
-			// 	if recvOk {
-			// 		ack, _ := recv.Interface().(*NullAck)
-			// 		if ack.Err != nil {
-			// 			uack.Err = ack.Err
-			// 		}
-			// 		close(allChs[chosen])
-			// 	}
-			// }
-			// upt.AckCh <- uack
-
+			ack.FIndex = fileIndex
 			for _, meta := range upt.Rebuilds {
 				buf := make([]byte, 4096)
 				n, err := f.ReadAt(buf, int64(meta.BIndex-fileIndex*db.checkpoint.RowsPerFile)*4096) //bindex换算成当前文件中的偏移量再读取
@@ -522,6 +432,7 @@ func (db *ArrayBase) processWrite(fileIndex uint64, opch *FileOpChan, f *os.File
 			upt.AckCh <- ack
 		case del := <-opch.DeleteCh:
 			ack := new(NullAck)
+			ack.FIndex = fileIndex
 			buf := make([]byte, 4096)
 			for _, bindex := range del.Deletes {
 				n, err := f.WriteAt(buf, int64(bindex-fileIndex*db.checkpoint.RowsPerFile)*4096)
@@ -535,6 +446,14 @@ func (db *ArrayBase) processWrite(fileIndex uint64, opch *FileOpChan, f *os.File
 				}
 			}
 			del.AckCh <- ack
+		case syncf := <-opch.SyncCh:
+			ack := new(NullAck)
+			ack.FIndex = fileIndex
+			err := f.Sync()
+			if err != nil {
+				ack.Err = err
+			}
+			syncf.AckCh <- ack
 		}
 	}
 }
