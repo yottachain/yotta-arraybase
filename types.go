@@ -1,7 +1,6 @@
 package ytarraybase
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 )
@@ -11,7 +10,7 @@ type Block struct {
 	VNF     uint8     //分片数
 	AR      int16     //副本数，
 	Shards  []*Shard  //block所属分片列表
-	Padding [149]byte //补齐4K
+	Padding [150]byte //补齐4K
 }
 
 type Shard struct {
@@ -27,40 +26,62 @@ type ShardRebuildMeta struct {
 	SID    uint32 //重建前shard所属矿机ID
 }
 
+type RebuildMeta struct {
+	BIndex    uint64
+	Transfers []*ShardTransfer
+}
+
+type ShardTransfer struct {
+	Offset uint8
+	NID    uint32
+	SID    uint32
+}
+
+type RebuildSlice []*ShardRebuildMeta
+
+func (s RebuildSlice) Len() int           { return len(s) }
+func (s RebuildSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s RebuildSlice) Less(i, j int) bool { return s[i].BIndex < s[j].BIndex }
+
 func (block *Block) ConvertBytes() []byte {
-	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, block.ID)
-	binary.Write(bytebuf, binary.BigEndian, block.VNF)
-	binary.Write(bytebuf, binary.BigEndian, block.AR)
+	buf := make([]byte, 4096)
+	binary.BigEndian.PutUint64(buf[0:8], block.ID)
+	buf[8] = block.VNF
+	binary.BigEndian.PutUint16(buf[9:11], uint16(block.AR))
+	i := 11
 	for _, shard := range block.Shards {
-		bytebuf.Write(shard.ConvertBytes())
+		copy(buf[i:i+24], shard.ConvertBytes())
+		i += 24
 	}
-	bytebuf.Write(block.Padding[:])
-	return bytebuf.Bytes()
+	return buf
 }
 
 func (shard *Shard) ConvertBytes() []byte {
-	bytebuf := bytes.NewBuffer([]byte{})
-	bytebuf.Write(shard.VHF[:])
-	binary.Write(bytebuf, binary.BigEndian, shard.NodeID)
-	binary.Write(bytebuf, binary.BigEndian, shard.NodeID2)
-	return bytebuf.Bytes()
+	buf := make([]byte, 24)
+	copy(buf, shard.VHF)
+	binary.BigEndian.PutUint32(buf[16:20], shard.NodeID)
+	binary.BigEndian.PutUint32(buf[20:24], shard.NodeID2)
+	return buf
 }
 
 func (block *Block) FillBy(data []byte) error {
-	err := binary.Read(bytes.NewReader(data[0:8]), binary.BigEndian, &(block.ID))
-	if err != nil {
-		return err
-	}
-	err = binary.Read(bytes.NewReader(data[8:9]), binary.BigEndian, &(block.VNF))
-	if err != nil {
-		return err
-	}
-	err = binary.Read(bytes.NewReader(data[9:11]), binary.BigEndian, &(block.AR))
-	if err != nil {
-		return err
-	}
-	for i := 11; i < int(11+24*block.VNF); i += 24 {
+	block.ID = binary.BigEndian.Uint64(data[0:8])
+	block.VNF = data[8]
+	block.AR = int16(binary.BigEndian.Uint16(data[9:11]))
+	// err := binary.Read(bytes.NewReader(data[0:8]), binary.BigEndian, &(block.ID))
+	// if err != nil {
+	// 	return err
+	// }
+	// err = binary.Read(bytes.NewReader(data[8:9]), binary.BigEndian, &(block.VNF))
+	// if err != nil {
+	// 	return err
+	// }
+	// err = binary.Read(bytes.NewReader(data[9:11]), binary.BigEndian, &(block.AR))
+	// if err != nil {
+	// 	return err
+	// }
+	end := 11 + 24*int(block.VNF)
+	for i := 11; i < end; i += 24 {
 		shard := new(Shard)
 		err := shard.FillBy(data[i : i+24])
 		if err != nil {
@@ -76,13 +97,15 @@ func (shard *Shard) FillBy(data []byte) error {
 		return errors.New("length of shard data is not 24")
 	}
 	shard.VHF = data[0:16]
-	err := binary.Read(bytes.NewReader(data[16:20]), binary.BigEndian, &(shard.NodeID))
-	if err != nil {
-		return err
-	}
-	err = binary.Read(bytes.NewReader(data[20:24]), binary.BigEndian, &(shard.NodeID2))
-	if err != nil {
-		return err
-	}
+	shard.NodeID = binary.BigEndian.Uint32(data[16:20])
+	shard.NodeID2 = binary.BigEndian.Uint32(data[20:24])
+	// err := binary.Read(bytes.NewReader(data[16:20]), binary.BigEndian, &(shard.NodeID))
+	// if err != nil {
+	// 	return err
+	// }
+	// err = binary.Read(bytes.NewReader(data[20:24]), binary.BigEndian, &(shard.NodeID2))
+	// if err != nil {
+	// 	return err
+	// }
 	return nil
 }
