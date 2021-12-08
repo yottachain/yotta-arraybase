@@ -6,35 +6,35 @@ import (
 )
 
 type Block struct {
-	ID      uint64    //block ID
-	VNF     uint8     //分片数
-	AR      int16     //副本数，
-	Shards  []*Shard  //block所属分片列表
-	Padding [150]byte //补齐4K
+	ID      uint64    `json:"id"`     //block ID
+	VNF     uint8     `json:"vnf"`    //分片数
+	AR      int16     `json:"ar"`     //副本数，
+	Shards  []*Shard  `json:"shards"` //block所属分片列表
+	Padding [150]byte `json:"-"`      //补齐4K
 }
 
 type Shard struct {
-	VHF     []byte //shard哈希值
-	NodeID  uint32 //shard所属矿机ID
-	NodeID2 uint32 //LRC2下shard所属副本矿机ID
+	VHF     []byte `json:"vhf"`  //shard哈希值
+	NodeID  uint32 `json:"nid"`  //shard所属矿机ID
+	NodeID2 uint32 `json:"nid2"` //LRC2下shard所属副本矿机ID
 }
 
 type ShardRebuildMeta struct {
-	BIndex uint64 //被重建shard对应的block在数组文件中的下标
-	Offset uint8  //被重建shard在block中的序号
-	NID    uint32 //重建后shard所属矿机ID
-	SID    uint32 //重建前shard所属矿机ID
+	BIndex uint64 `json:"bindex"` //被重建shard对应的block在数组文件中的下标
+	Offset uint8  `json:"offset"` //被重建shard在block中的序号
+	NID    uint32 `json:"nid"`    //重建后shard所属矿机ID
+	SID    uint32 `json:"sid"`    //重建前shard所属矿机ID
 }
 
 type RebuildMeta struct {
-	BIndex    uint64
-	Transfers []*ShardTransfer
+	BIndex    uint64           `json:"bindex"`
+	Transfers []*ShardTransfer `json:"transfers"`
 }
 
 type ShardTransfer struct {
-	Offset uint8
-	NID    uint32
-	SID    uint32
+	Offset uint8  `json:"offset"`
+	NID    uint32 `json:"nid"`
+	SID    uint32 `json:"sid"`
 }
 
 type RebuildSlice []*ShardRebuildMeta
