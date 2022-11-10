@@ -401,7 +401,9 @@ func (db *ArrayBase) processWrite(fileIndex uint64, opch *FileOpChan, f *os.File
 				}
 				for _, t := range meta.Transfers {
 					shard := block.Shards[t.Offset]
-					if t.SID == shard.NodeID && shard.NodeID2 == 0 {
+					if t.SID == 0 && shard.NodeID2 == 0 {
+						shard.NodeID2 = t.NID
+					} else if t.SID == shard.NodeID && shard.NodeID2 == 0 {
 						shard.NodeID = t.NID
 					} else if t.SID == shard.NodeID && shard.NodeID == shard.NodeID2 {
 						shard.NodeID = t.NID
