@@ -77,26 +77,15 @@ func (block *Block) FillBy(data []byte) error {
 	block.KED = data[56:88]
 	block.VNF = data[88]
 	block.AR = int16(binary.BigEndian.Uint16(data[89:91]))
-	// err := binary.Read(bytes.NewReader(data[0:8]), binary.BigEndian, &(block.ID))
-	// if err != nil {
-	// 	return err
-	// }
-	// err = binary.Read(bytes.NewReader(data[8:9]), binary.BigEndian, &(block.VNF))
-	// if err != nil {
-	// 	return err
-	// }
-	// err = binary.Read(bytes.NewReader(data[9:11]), binary.BigEndian, &(block.AR))
-	// if err != nil {
-	// 	return err
-	// }
 	end := 91 + 24*int(block.VNF)
+	block.Shards = make([]*Shard, block.VNF)
+	shardsTmp := make([]Shard, block.VNF)
 	for i := 91; i < end; i += 24 {
-		shard := new(Shard)
-		err := shard.FillBy(data[i : i+24])
+		err := (&(shardsTmp[(i-91)/24])).FillBy(data[i : i+24])
 		if err != nil {
 			return err
 		}
-		block.Shards = append(block.Shards, shard)
+		block.Shards[(i-91)/24] = &(shardsTmp[(i-91)/24])
 	}
 	return nil
 }
@@ -108,13 +97,5 @@ func (shard *Shard) FillBy(data []byte) error {
 	shard.VHF = data[0:16]
 	shard.NodeID = binary.BigEndian.Uint32(data[16:20])
 	shard.NodeID2 = binary.BigEndian.Uint32(data[20:24])
-	// err := binary.Read(bytes.NewReader(data[16:20]), binary.BigEndian, &(shard.NodeID))
-	// if err != nil {
-	// 	return err
-	// }
-	// err = binary.Read(bytes.NewReader(data[20:24]), binary.BigEndian, &(shard.NodeID2))
-	// if err != nil {
-	// 	return err
-	// }
 	return nil
 }

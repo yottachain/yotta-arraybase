@@ -156,6 +156,78 @@ func InitArrayBase(ctx context.Context, baseDir string, rowsPerFile uint64, read
 	return arrayBase, nil
 }
 
+type BlockIterator struct {
+	files       []*os.File
+	count       uint64
+	index       uint64
+	rowsPerFile uint64
+	fileOffset  uint64
+}
+
+func (iter *BlockIterator) HasNext() bool {
+	b := iter.index < (iter.count-1)*iter.rowsPerFile+iter.fileOffset
+	if !b {
+		for _, f := range iter.files {
+			f.Close()
+		}
+	}
+	return b
+}
+
+func (iter *BlockIterator) Close() {
+	for _, f := range iter.files {
+		f.Close()
+	}
+}
+
+func (iter *BlockIterator) Next(count uint64) (v []*Block) {
+	findex := iter.index / iter.rowsPerFile
+	if findex == iter.count-1 {
+		if (iter.count-1)*iter.rowsPerFile+iter.fileOffset-iter.index < count {
+			count = (iter.count-1)*iter.rowsPerFile + iter.fileOffset - iter.index
+		}
+	} else {
+		if (findex+1)*iter.rowsPerFile-iter.index < count {
+			count = (findex+1)*iter.rowsPerFile - iter.index
+		}
+	}
+	buf := make([]byte, 4096*count)
+	n, err := iter.files[findex].ReadAt(buf, int64(iter.index-findex*iter.rowsPerFile)*4096)
+	if err != nil {
+		panic(err)
+	}
+	if n != 4096*int(count) {
+		panic(fmt.Errorf("length of read data is not %d", int(iter.index-findex*iter.rowsPerFile)*4096))
+	}
+	blocksTmp := make([]Block, count)
+	blocks := make([]*Block, count)
+	for i := 0; i < int(count); i++ {
+		err = (&blocksTmp[i]).FillBy(buf[4096*i : 4096*(i+1)])
+		if err != nil {
+			panic(err)
+		}
+		blocks[i] = &blocksTmp[i]
+	}
+
+	iter.index += count
+	return blocks
+}
+
+func (db *ArrayBase) Iterator() *BlockIterator {
+	if db.checkpoint == nil {
+		panic(errors.New("arraybase is not initialized"))
+	}
+	files := make([]*os.File, 0)
+	for i := 0; i <= int(db.checkpoint.FileIndex); i++ {
+		f, err := os.OpenFile(filepath.Join(db.baseDir, fmt.Sprintf("%d.dat", i)), os.O_RDWR|os.O_CREATE, 0755)
+		if err != nil {
+			panic(err)
+		}
+		files = append(files, f)
+	}
+	return &BlockIterator{files: files, count: db.checkpoint.FileIndex + 1, index: 0, rowsPerFile: db.checkpoint.RowsPerFile, fileOffset: db.checkpoint.FileOffset}
+}
+
 func (db *ArrayBase) read() {
 	for msg := range db.readCh {
 		m := make(map[uint64][]uint64)
