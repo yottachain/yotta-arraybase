@@ -213,7 +213,7 @@ func (iter *BlockIterator) Next(count uint64) (v []*Block) {
 	return blocks
 }
 
-func (db *ArrayBase) Iterator() *BlockIterator {
+func (db *ArrayBase) Iterator(from uint64) *BlockIterator {
 	if db.checkpoint == nil {
 		panic(errors.New("arraybase is not initialized"))
 	}
@@ -225,7 +225,7 @@ func (db *ArrayBase) Iterator() *BlockIterator {
 		}
 		files = append(files, f)
 	}
-	return &BlockIterator{files: files, count: db.checkpoint.FileIndex + 1, index: 0, rowsPerFile: db.checkpoint.RowsPerFile, fileOffset: db.checkpoint.FileOffset}
+	return &BlockIterator{files: files, count: db.checkpoint.FileIndex + 1, index: from, rowsPerFile: db.checkpoint.RowsPerFile, fileOffset: db.checkpoint.FileOffset}
 }
 
 func (db *ArrayBase) read() {
